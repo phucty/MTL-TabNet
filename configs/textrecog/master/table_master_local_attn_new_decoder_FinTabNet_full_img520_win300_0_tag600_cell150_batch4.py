@@ -3,11 +3,11 @@ _base_ = [
 ]
 
 
-alphabet_file = './tools/data/alphabet/structure_alphabet.txt'
+alphabet_file = './configs/textrecog/master/fintabnet_alphabet/structure_alphabet.txt'
 alphabet_len = len(open(alphabet_file, 'r').readlines())
-max_seq_len = 501
+max_seq_len = 601
 
-cell_alphabet_file = './tools/data/alphabet/textline_recognition_alphabet.txt'
+cell_alphabet_file = './configs/textrecog/master/fintabnet_alphabet/textline_recognition_alphabet.txt'
 cell_alphabet_len = len(open(cell_alphabet_file, 'r').readlines())
 max_seq_len_cell = 150
 
@@ -58,8 +58,8 @@ model = dict(
                 headers=8,
                 d_model=512,
                 dropout=0.,
-                structure_window=100,
-                cell_window=50),
+                structure_window=300,
+                cell_window=0),
             src_attn=dict(
                 headers=8,
                 d_model=512,
@@ -85,10 +85,10 @@ train_pipeline = [
     dict(
         type='TableResize',
         keep_ratio=True,
-        long_size=480),
+        long_size=520),
     dict(
         type='TablePad',
-        size=(480, 480),
+        size=(520, 520),
         pad_val=0,
         return_mask=True,
         mask_ratio=(8, 8),
@@ -110,10 +110,10 @@ valid_pipeline = [
     dict(
         type='TableResize',
         keep_ratio=True,
-        long_size=480),
+        long_size=520),
     dict(
         type='TablePad',
-        size=(480, 480),
+        size=(520, 520),
         pad_val=0,
         return_mask=True,
         mask_ratio=(8, 8),
@@ -135,10 +135,10 @@ test_pipeline = [
     dict(
         type='TableResize',
         keep_ratio=True,
-        long_size=480),
+        long_size=520),
     dict(
         type='TablePad',
-        size=(480, 480),
+        size=(520, 520),
         pad_val=0,
         return_mask=True,
         mask_ratio=(8, 8),
@@ -157,9 +157,9 @@ test_pipeline = [
         ]),
 ]
 
-dataset_type = 'OCRTableDataset'
-train_img_prefix = '/home2/nam/pubtabnet/pubtabnet/train/'
-train_anno_file1 = '/home2/nam/nam_data/data/mmocr_pubtabnet_recognition_0726_train/StructureLabelAddEmptyBbox_train/'
+dataset_type = 'OCRFinTabDataset'
+train_img_prefix = '/disks/strg16-176/nam/data/fintabnet/img_tables/train/'
+train_anno_file1 = '/home2/nam/nam_data/data/mmocr_fintabnet_recognition_0726_train/StructureLabelAddEmptyBbox_train/'
 train1 = dict(
     type=dataset_type,
     img_prefix=train_img_prefix,
@@ -176,8 +176,8 @@ train1 = dict(
     pipeline=train_pipeline,
     test_mode=False)
 
-valid_img_prefix = '/home2/nam/pubtabnet/pubtabnet/val/'
-valid_anno_file1 = '/home2/nam/nam_data/data/mmocr_pubtabnet_recognition_0726_val_256/StructureLabelAddEmptyBbox_val/'
+valid_img_prefix = '/disks/strg16-176/nam/data/fintabnet/img_tables/val/'
+valid_anno_file1 = '/home2/nam/nam_data/data/mmocr_fintabnet_recognition_0726_val_64/StructureLabelAddEmptyBbox_val/'
 valid = dict(
     type=dataset_type,
     img_prefix=valid_img_prefix,
@@ -195,8 +195,8 @@ valid = dict(
     dataset_info='table_master_dataset',
     test_mode=True)
 
-test_img_prefix = '/home2/nam/pubtabnet/pubtabnet/val/'
-test_anno_file1 = '/home2/nam/nam_data/data/mmocr_pubtabnet_recognition_0726_val_256/StructureLabelAddEmptyBbox_val/'
+test_img_prefix = '/disks/strg16-176/nam/data/fintabnet/img_tables/val/'
+test_anno_file1 = '/home2/nam/nam_data/data/mmocr_fintabnet_recognition_0726_val_256/StructureLabelAddEmptyBbox_val/'
 test = dict(
     type=dataset_type,
     img_prefix=test_img_prefix,
@@ -232,8 +232,7 @@ lr_config = dict(
     warmup='linear',
     warmup_iters=50,
     warmup_ratio=1.0 / 3,
-    step=[12, 15])
-    # step=[12, 17])
+    step=[12, 17])
 total_epochs = 20
 
 # evaluation
@@ -257,7 +256,7 @@ log_config = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
-resume_from = '/home2/nam/nam_data/work_dir/1114_TableMASTER_local_attn_new_decoder_win100_50_tag500_cell150_batch4/epoch_17.pth'
+resume_from = None
 workflow = [('train', 1)]
 
 # if raise find unused_parameters, use this.

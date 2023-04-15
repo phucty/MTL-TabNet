@@ -1,14 +1,58 @@
-import os
-import json
-import time
-import pickle
-from metric import TEDS
-from multiprocessing import Pool
+
+import torch
+from mmcv.image import imread, imwrite, gray2bgr
+
+from mmdet.apis import init_detector
+from mmocr.apis.inference import model_inference
+from mmocr.datasets import build_dataset  # noqa: F401
+from mmocr.models import build_detector  # noqa: F401
+
+from tqdm import tqdm
 import glob
 import re
 import copy
-import shutil
+
+
+import cv2
+import numpy as np
+from PIL import Image
+import os
 import sys
+
+IMAGE_EXT = "jpg"
+
+
+def find_edge(img_path: str):
+    img = cv2.imread(img_path, 0)
+    blur = cv2.blur(img, (5, 5))
+    edges = cv2.Canny(blur, 100, 200)
+    return edges
+
+
+def find_target(edges):
+    results = np.where(edges == 255)
+    top = np.min(results[0])
+    bottom = np.max(results[0]) - 1
+    left = np.min(results[1])
+    right = np.max(results[1]) - 1
+    return (left, top, right, bottom)
+
+
+def to_RGB(image: Image):
+    if image.mode == 'RGB': return image
+    background = Image.new("RGB", image.size, (255, 255, 255))
+    background.paste(image, mask=image.split()[3])  # 3 is the alpha channel
+    background.format = image.format
+    return background
+
+
+def get_crop_img(img_path: str):
+    edges = find_edge(img_path)
+    left, top, right, bottom = find_target(edges)
+    rgb_img = to_RGB(Image.open(img_path))
+    trim_img = rgb_img.crop((left - 1, top - 1, right + 1, bottom + 1))
+
+    return trim_img
 
 
 def deal_isolate_span(thead_part):
@@ -270,124 +314,204 @@ def text_to_list(master_token):
     return master_token_list
 
 
-def pickle_load(path, prefix='end2end'):
-    if os.path.isfile(path):
-        data = pickle.load(open(path, 'rb'))
-    elif os.path.isdir(path):
-        data = dict()
-        search_path = os.path.join(path, '{}_*.pkl'.format(prefix))
-        pkls = glob.glob(search_path)
-        for pkl in pkls:
-            this_data = pickle.load(open(pkl, 'rb'))
-            data.update(this_data)
-    else:
-        raise ValueError
-    return data
+def pp_table_recognition(result_dict, path_html):
+    file_name, context = result_dict
+    pred_text = context['text']
+    pred_cells = context['cell']
+    pred_html = insert_text_to_token(text_to_list(pred_text), pred_cells)
+    with open(os.path.join(path_html, file_name.replace(IMAGE_EXT, 'txt')), 'w') as f_html:
+        f_html.write(pred_html + '\n')
 
 
-def htmlPostProcess(text):
-    text = '<html><body>' + text + '</body></html>'
-    return text
+def build_model(config_file, checkpoint_file):
+    device = 'cpu'
+    model = init_detector(config_file, checkpoint=checkpoint_file, device=device)
+
+    if model.cfg.data.test['type'] == 'ConcatDataset':
+        model.cfg.data.test.pipeline = model.cfg.data.test['datasets'][
+            0].pipeline
+
+    return model
 
 
-def singleEvaluation(teds, file_name, context, gt_context):
-    # save problem log
-    # save_folder = ''
+class Inference:
+    def __init__(self, config_file, checkpoint_file, device=None):
+        self.config_file = config_file
+        self.checkpoint_file = checkpoint_file
+        self.model = build_model(config_file, checkpoint_file)
 
-    # html format process
-    htmlContext = htmlPostProcess(context)
-    htmlGtContext = htmlPostProcess(gt_context)
-    # Evaluate
-    score = teds.evaluate(htmlContext, htmlGtContext)
+        if device is None:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        else:
+            # Specify GPU device
+            device = torch.device("cuda:{}".format(device))
 
-    print("FILENAME : {}".format(file_name))
-    print("SCORE    : {}".format(score))
-    return score
+        self.model.to(device)
 
+    def result_format(self, pred, file_path):
+        raise NotImplementedError
 
-def visual_pred_bboxes(bboxes, filename, dir_path, dir_img):
-    """
-    visual after normalized bbox in results.
-    :param results:
-    :return:
-    """
-    import cv2
-    import numpy as np
+    def predict_single_file(self, file_path):
+        pass
 
-    os.makedirs(dir_path, exist_ok=True)
-
-    img = cv2.imread(dir_img + filename)
-    save_path = dir_path + '{}_pred_bbox.png'. \
-        format(filename.split('.')[0])
-
-    # x,y,w,h to x,y,x,y
-    new_bboxes = np.empty_like(bboxes)
-    new_bboxes[..., 0] = bboxes[..., 0] - bboxes[..., 2] / 2
-    new_bboxes[..., 1] = bboxes[..., 1] - bboxes[..., 3] / 2
-    new_bboxes[..., 2] = bboxes[..., 0] + bboxes[..., 2] / 2
-    new_bboxes[..., 3] = bboxes[..., 1] + bboxes[..., 3] / 2
-
-    table_height = img.shape[0]
-
-    # draw
-    for new_bbox in new_bboxes:
-        orig_annotation = copy.copy(new_bbox)
-        new_bbox[3] = table_height-orig_annotation[1]
-        new_bbox[1] = table_height-orig_annotation[3]
-        img = cv2.rectangle(img, (int(new_bbox[0]), int(new_bbox[1])),
-                            (int(new_bbox[2]), int(new_bbox[3])), (0, 255, 0), thickness=1)
-    cv2.imwrite(save_path, img)
+    def predict_batch(self, imgs):
+        pass
 
 
-if __name__ == "__main__":
+class Structure_Recognition(Inference):
+    def __init__(self, config_file, checkpoint_file, samples_per_gpu=4):
+        self.config_file = config_file
+        self.checkpoint_file = checkpoint_file
+        super().__init__(config_file, checkpoint_file)
+        self.samples_per_gpu = samples_per_gpu
 
-    epoch_id = int(sys.argv[1])
+    def result_format(self, pred, file_path=None):
+        pred = pred[0]
+        return pred
 
-    val_test = 'train'
+    def predict_single_file(self, file_path):
 
-    t_start = time.time()
-    pool = Pool(64)
-    start_time = time.time()
-    predFile = '/disks/strg16-176/nam/VQAonBD2023/' + val_test + '/' + val_test + '_infer_alldata/'
+        new_path = file_path[:-3] + 'png'
+        try:
+            dst = get_crop_img(file_path)
+            dst.save(new_path)
 
-    infer_html_dir = predFile + 'infer_html/'
-    os.makedirs(infer_html_dir, exist_ok=True)
-    predFile_vis = predFile + 'visual/'
-    os.makedirs(predFile_vis, exist_ok=True)
+            # numpy inference
+            img = cv2.imread(new_path)
 
-    fintabnet_dir = '/disks/strg16-176/nam/VQAonBD2023/' + val_test + '/' + val_test + '_pp/'
+            h, w, _ = img.shape
+            w = int(w / 4)
+            h = int(h / 4)
 
-    # Initialize TEDS object
-    teds = TEDS(structure_only=False, n_jobs=1) #, ignore_nodes='b')
+            img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+            cv2.imwrite(new_path, img)
+        except:
+            print(file_path)
+            return
 
-    predDict = pickle_load(predFile + 'predFile/', prefix='structure')
-
-    scores_simple = []
-    scores_complex = []
-    caches = dict()
-    for idx, (file_name, context) in enumerate(predDict.items()):
-        # loading html of prediction
-        print(idx)
-        pred_text = context['text']
-        pred_cells = context['cell']
-
-        pred_html = insert_text_to_token(text_to_list(pred_text), pred_cells)
-        # pred_html = deal_bb(pred_html)
-
-        # # visualize bboxes
-        visual_pred_bboxes(context['bbox'], file_name, predFile_vis, fintabnet_dir)
-        # shutil.copy(fintabnet_dir + file_name, predFile)
-
-        f = open(os.path.join(infer_html_dir, file_name.replace('.png', '.txt')), 'w')
-        f.write(pred_html+'\n')
-        f.close()
-
-    pool.close()
-    pool.join() # 进程池中进程执行完毕后再关闭，如果注释，那么程序直接关闭。
-    pool.terminate()
+        # numpy inference
+        img = imread(new_path)
+        file_name = os.path.basename(file_path)
+        result = model_inference(self.model, [img], batch_mode=True)
+        result = self.result_format(result, file_path)
+        result_dict = (file_name, result)
+        return result, result_dict
 
 
+class Runner:
+    def __init__(self, cfg):
+        self.structure_master_config = cfg['structure_master_config']
+        self.structure_master_ckpt = cfg['structure_master_ckpt']
+        self.structure_master_result_folder = cfg['structure_master_result_folder']
+
+        test_folder = cfg['test_folder']
+        chunks_nums = cfg['chunks_nums']
+        self.chunks_nums = chunks_nums
+        self.chunks = self.get_file_chunks(test_folder, chunks_nums=chunks_nums)
+
+    def init_structure_master(self):
+        self.master_structure_inference = \
+            Structure_Recognition(self.structure_master_config, self.structure_master_ckpt)
+
+    def release_structure_master(self):
+        torch.cuda.empty_cache()
+        del self.master_structure_inference
+
+
+    def do_structure_predict(self, path, is_save=True, gpu_idx=None):
+        if isinstance(path, str):
+            if os.path.isfile(path):
+                print('Single file in structure master prediction ...')
+                _, result_dict = self.master_structure_inference.predict_single_file(path)
+                pp_table_recognition(result_dict, self.structure_master_result_folder)
+
+            elif os.path.isdir(path):
+                print('Folder files in structure master prediction ...')
+                search_path = os.path.join(path, '*.' + IMAGE_EXT)
+                files = glob.glob(search_path)
+                for file in tqdm(files):
+                    _, result_dict = self.master_structure_inference.predict_single_file(file)
+                    pp_table_recognition(result_dict, self.structure_master_result_folder)
+
+            else:
+                raise ValueError
+
+        elif isinstance(path, list):
+            print('Chunks files in structure master prediction ...')
+            for i, p in enumerate(path):
+                try:
+                    _, result_dict = self.master_structure_inference.predict_single_file(p)
+                    pp_table_recognition(result_dict, self.structure_master_result_folder)
+                    if gpu_idx is not None:
+                        print("[GPU_{} : {} / {}] {} file structure inference. ".format(gpu_idx, i+1, len(path), p))
+                    else:
+                        print("{} file structure inference. ".format(p))
+                except:
+                    continue
+
+        else:
+            raise ValueError
+
+
+    def get_file_chunks(self, folder, chunks_nums=8):
+        """
+        Divide files in folder to different chunks, before inference in multiply gpu devices.
+        :param folder:
+        :return:
+        """
+        print("Divide files to chunks for multiply gpu device inference.")
+        file_paths = glob.glob(folder + '*.' + IMAGE_EXT)
+        counts = len(file_paths)
+        nums_per_chunk = counts // chunks_nums
+        img_chunks = []
+        for n in range(chunks_nums):
+            if n == chunks_nums - 1:
+                s = n * nums_per_chunk
+                img_chunks.append(file_paths[s:])
+            else:
+                s = n * nums_per_chunk
+                e = (n + 1) * nums_per_chunk
+                img_chunks.append(file_paths[s:e])
+        return img_chunks
+
+
+    def run_structure_single_chunk(self, chunk_id):
+        # list of path
+        paths = self.chunks[chunk_id]
+
+        # structure master
+        self.init_structure_master()
+        self.do_structure_predict(paths, is_save=True, gpu_idx=chunk_id)
+        self.release_structure_master()
 
 
 
 
+if __name__ == '__main__':
+    # Runner
+    chunk_nums = int(sys.argv[1])
+    chunk_id = int(sys.argv[2])
+
+    cfg = {
+        # config file
+        'structure_master_config': './configs/textrecog/master/table_master_local_attn_new_decoder_FinTabNet_full_img520_win300_0_tag600_cell150_batch4.py',        # structure
+
+        # check point file
+        'structure_master_ckpt': '/home2/nam/nam_data/work_dir/1114_TableMASTER_local_attn_new_decoder_FinTabNet_full_img520_win300_0_tag600_cell150_batch4/epoch_20.pth',              # structure
+
+        # folder that store predicted table HTML
+        'structure_master_result_folder': '/disks/strg16-176/nam/VQAonBD2023/test/test_html_infer/',
+
+        # input image folder
+        'test_folder': '/disks/strg16-176/nam/VQAonBD2023/test/VQAonBD_testset/test_images/',
+
+        'chunks_nums': chunk_nums
+    }
+
+    print(cfg)
+    if not os.path.exists(cfg['structure_master_result_folder']):
+        os.makedirs(cfg['structure_master_result_folder'], exist_ok=True)
+
+    runner = Runner(cfg)
+    # structure task
+    runner.run_structure_single_chunk(chunk_id=chunk_id)
